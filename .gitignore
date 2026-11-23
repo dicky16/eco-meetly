@@ -1,1 +1,9 @@
+node_modules/
+dist/
+dist-electron/
+release/
+*.sqlite
+*.wav
+.DS_Store
+
 /prds
