@@ -23,8 +23,9 @@ export function exportMeetingArtifacts(
   fs.mkdirSync(meeting.folderPath, { recursive: true });
 
   const transcriptLines = segments.map((seg) => {
+    const spk = seg.speaker ? ` [${seg.speaker}]` : '';
     const lang = seg.detectedLanguage ? ` [${seg.detectedLanguage.toUpperCase()}]` : '';
-    return `[${formatTimestamp(seg.startTimeMs)} - ${formatTimestamp(seg.endTimeMs)}]${lang} ${seg.text}`;
+    return `[${formatTimestamp(seg.startTimeMs)} - ${formatTimestamp(seg.endTimeMs)}]${spk}${lang} ${seg.text}`;
   });
   const transcriptBody = transcriptLines.join('\n');
 

@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getDefaultSettings } from '../electron/services/settings';
-import { toWhisperLanguage, TranscriptionService } from '../electron/services/transcription';
+import { segmentPcm16kSmart, toWhisperLanguage, TranscriptionService } from '../electron/services/transcription';
 
 vi.mock('electron', () => ({
   app: {
@@ -87,5 +87,41 @@ describe('TranscriptionService', () => {
     expect(autoRes).toEqual({ text: 'We start the meeting today.', detectedLanguage: 'auto' });
 
     expect(runSpy).toHaveBeenCalled();
+  });
+
+  it('falls back to primaryLanguage in bilingual mode when auto-detect drifts to non-Latin script', async () => {
+    const svc = new TranscriptionService();
+    vi.spyOn(svc as any, 'runWhisper').mockImplementation(async (...args: unknown[]) => {
+      const opts = args[2] as { language?: string };
+      if (!opts.language) return 'Привет мир тест';
+      return 'Halo dunia tes';
+    });
+
+    const settings = {
+      ...getDefaultSettings(),
+      languageMode: 'bilingual' as const,
+      primaryLanguage: 'id',
+      secondaryLanguage: 'en',
+    };
+    const res = await svc.transcribeFloat32(new Float32Array(16000), settings);
+    expect(res).toEqual({ text: 'Halo dunia tes', detectedLanguage: 'id' });
+  });
+
+  it('segments 16 kHz PCM at quiet pauses and skips pure silence', () => {
+    const sr = 16000;
+    const total = sr * 30;
+    const pcm = new Float32Array(total);
+    // Fill speech at 0..17s and 18..30s, leaving a quiet pause around 17..18s
+    for (let i = 0; i < sr * 17; i++) pcm[i] = 0.2 * Math.sin(i * 0.05);
+    for (let i = sr * 18; i < total; i++) pcm[i] = 0.2 * Math.sin(i * 0.05);
+
+    const segs = segmentPcm16kSmart(pcm);
+    expect(segs.length).toBe(2);
+    // First segment should cut inside the 17..18s pause
+    expect(segs[0].endTimeMs).toBeGreaterThanOrEqual(17000);
+    expect(segs[0].endTimeMs).toBeLessThanOrEqual(18000);
+
+    // Pure silence should yield 0 segments
+    expect(segmentPcm16kSmart(new Float32Array(sr * 5))).toHaveLength(0);
   });
 });

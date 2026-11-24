@@ -58,6 +58,9 @@ export function App() {
   const [editingSummary, setEditingSummary] = useState(false);
   const [summaryDraft, setSummaryDraft] = useState('');
 
+  const [editingSpeaker, setEditingSpeaker] = useState<{ segmentId: string; oldName: string } | null>(null);
+  const [speakerDraft, setSpeakerDraft] = useState('');
+
   // Recording State
   const [isRecording, setIsRecording] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
@@ -166,12 +169,22 @@ export function App() {
         startTimeMs: startMs,
         endTimeMs: endMs,
       });
-      if (added) {
-        setSegments((prev) => [...prev, added]);
+      if (added.length > 0) {
+        setSegments((prev) => [...prev, ...added]);
       }
     } catch (err) {
       console.error('Transcription error:', err);
     }
+  };
+
+  const handleSaveSpeakerRename = async () => {
+    if (!editingSpeaker || !selectedMeeting) return;
+    const trimmed = speakerDraft.trim();
+    if (trimmed && trimmed !== editingSpeaker.oldName) {
+      const updated = await window.ecoMeetly.renameSpeaker(selectedMeeting.id, editingSpeaker.oldName, trimmed);
+      setSegments(updated);
+    }
+    setEditingSpeaker(null);
   };
 
   const handleStartRecording = async () => {
@@ -615,7 +628,9 @@ export function App() {
                       <button
                         onClick={() =>
                           navigator.clipboard.writeText(
-                            segments.map((s) => `[${formatMs(s.startTimeMs)}] ${s.text}`).join('\n')
+                            segments
+                              .map((s) => `[${formatMs(s.startTimeMs)}]${s.speaker ? ` [${s.speaker}]` : ''} ${s.text}`)
+                              .join('\n')
                           )
                         }
                         className="inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-muted"
@@ -677,21 +692,67 @@ export function App() {
                         : 'No matching transcript segments.'}
                   </p>
                 ) : (
-                  filteredSegments.map((seg) => (
-                    <div key={seg.id} className="rounded-lg border bg-card p-3 space-y-1">
-                      <div className="flex items-center justify-between text-[11px] text-muted-foreground">
-                        <span className="font-mono">
-                          {formatMs(seg.startTimeMs)} – {formatMs(seg.endTimeMs)}
-                        </span>
-                        {seg.detectedLanguage && (
-                          <span className="rounded bg-secondary px-1.5 py-0.5 font-semibold text-secondary-foreground uppercase">
-                            {seg.detectedLanguage}
-                          </span>
-                        )}
+                  filteredSegments.map((seg) => {
+                    const spkName = seg.speaker || 'Speaker 1';
+                    const spkNum = parseInt(spkName.replace(/\D/g, ''), 10) || 1;
+                    const badgePalette = [
+                      'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border-emerald-500/30',
+                      'bg-sky-500/15 text-sky-700 dark:text-sky-300 border-sky-500/30',
+                      'bg-amber-500/15 text-amber-700 dark:text-amber-300 border-amber-500/30',
+                      'bg-violet-500/15 text-violet-700 dark:text-violet-300 border-violet-500/30',
+                    ];
+                    const badgeClass = badgePalette[(spkNum - 1) % badgePalette.length];
+
+                    return (
+                      <div key={seg.id} className="rounded-lg border bg-card p-3 space-y-1.5">
+                        <div className="flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
+                          <div className="flex items-center gap-2">
+                            {editingSpeaker?.segmentId === seg.id ? (
+                              <span className="inline-flex items-center gap-1">
+                                <input
+                                  autoFocus
+                                  type="text"
+                                  value={speakerDraft}
+                                  onChange={(e) => setSpeakerDraft(e.target.value)}
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter') void handleSaveSpeakerRename();
+                                    if (e.key === 'Escape') setEditingSpeaker(null);
+                                  }}
+                                  className="w-28 rounded border bg-background px-1.5 py-0.5 text-[11px] font-semibold text-foreground outline-none focus:ring-1 focus:ring-primary"
+                                />
+                                <button
+                                  onClick={() => void handleSaveSpeakerRename()}
+                                  className="text-primary hover:underline"
+                                >
+                                  Save
+                                </button>
+                              </span>
+                            ) : (
+                              <button
+                                onClick={() => {
+                                  setEditingSpeaker({ segmentId: seg.id, oldName: spkName });
+                                  setSpeakerDraft(spkName);
+                                }}
+                                className={`rounded-full border px-2 py-0.5 text-[11px] font-semibold transition-opacity hover:opacity-80 ${badgeClass}`}
+                                title="Click to rename speaker"
+                              >
+                                {spkName}
+                              </button>
+                            )}
+                            <span className="font-mono">
+                              {formatMs(seg.startTimeMs)} – {formatMs(seg.endTimeMs)}
+                            </span>
+                          </div>
+                          {seg.detectedLanguage && (
+                            <span className="rounded bg-secondary px-1.5 py-0.5 font-semibold text-secondary-foreground uppercase">
+                              {seg.detectedLanguage}
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-sm leading-relaxed">{seg.text}</p>
                       </div>
-                      <p className="text-sm leading-relaxed">{seg.text}</p>
-                    </div>
-                  ))
+                    );
+                  })
                 )}
                 <div ref={transcriptEndRef} />
               </div>

@@ -289,10 +289,19 @@ export class TranscriptionService {
   }
 
   private inferLanguageFromText(text: string, primary: string, secondary: string): string {
+    const latinLangs = new Set(['id', 'en', 'ms', 'jv', 'su', 'es', 'fr', 'de']);
+    if (latinLangs.has(primary) && latinLangs.has(secondary)) {
+      // Reject non-Latin script hallucinations (e.g. Cyrillic, CJK, Arabic) when expecting Latin languages
+      const nonLatinChars = (text.match(/[^\u0000-\u024F\s\d.,!?'"():;\-–—]/g) ?? []).length;
+      if (nonLatinChars > Math.max(2, text.length * 0.15)) {
+        return 'unknown';
+      }
+    }
+
     const lower = text.toLowerCase();
     // Common Indonesian markers to prevent drift on mixed meetings
-    const idMarkers = /\b(yang|dan|di|ke|dari|untuk|ini|itu|dengan|tidak|ada|kita|kami|saya|sudah|bisa|akan|jadi|atau|karena|kalau|ya|oke|baik)\b/;
-    const enMarkers = /\b(the|and|is|are|to|of|in|for|that|this|with|we|you|have|will|can|not|but|on|at)\b/;
+    const idMarkers = /\b(yang|dan|di|ke|dari|untuk|ini|itu|dengan|tidak|ada|kita|kami|saya|sudah|bisa|akan|jadi|atau|karena|kalau|ya|oke|baik|juga|dalam|pada|mereka|belum|mau)\b/;
+    const enMarkers = /\b(the|and|is|are|to|of|in|for|that|this|with|we|you|have|will|can|not|but|on|at|from|they|it)\b/;
 
     const hasId = idMarkers.test(lower);
     const hasEn = enMarkers.test(lower);
@@ -301,7 +310,91 @@ export class TranscriptionService {
       if (hasId && !hasEn) return 'id';
       if (hasEn && !hasId) return 'en';
       if (hasId) return 'id';
+      const wordCount = lower.split(/\s+/).filter(Boolean).length;
+      if (wordCount >= 3 && !hasId && !hasEn) {
+        return 'unknown';
+      }
     }
     return primary;
   }
+}
+
+export interface Pcm16kSegment {
+  samples: Float32Array;
+  startTimeMs: number;
+  endTimeMs: number;
+}
+
+/**
+ * Splits a 16 kHz mono PCM buffer at low-energy pauses (between 16s and 26s),
+ * skips silent windows, normalizes quiet speech, and adds 150ms silence padding.
+ */
+export function segmentPcm16kSmart(pcm16k: Float32Array): Pcm16kSegment[] {
+  const sr = 16000;
+  const minChunk = sr * 16;
+  const targetChunk = sr * 22;
+  const maxChunk = sr * 26;
+  const winSize = 1600; // 100ms energy window
+  const segments: Pcm16kSegment[] = [];
+
+  let offset = 0;
+  while (offset < pcm16k.length) {
+    let end = Math.min(offset + targetChunk, pcm16k.length);
+
+    // Search for the quietest 100ms pause between 16s and 26s so words are not cut mid-syllable
+    if (offset + maxChunk < pcm16k.length) {
+      let bestPos = end;
+      let lowestEnergy = Infinity;
+      const searchStart = offset + minChunk;
+      const searchEnd = Math.min(offset + maxChunk, pcm16k.length - winSize);
+      for (let pos = searchStart; pos <= searchEnd; pos += winSize) {
+        let sumSq = 0;
+        for (let i = 0; i < winSize; i++) {
+          const s = pcm16k[pos + i];
+          sumSq += s * s;
+        }
+        const rms = Math.sqrt(sumSq / winSize);
+        if (rms < lowestEnergy) {
+          lowestEnergy = rms;
+          bestPos = pos + Math.floor(winSize / 2);
+        }
+      }
+      end = bestPos;
+    }
+
+    const slice = pcm16k.subarray(offset, end);
+    let sumSq = 0;
+    let mean = 0;
+    for (let i = 0; i < slice.length; i++) {
+      mean += slice[i];
+    }
+    mean /= Math.max(1, slice.length);
+
+    let peak = 0;
+    for (let i = 0; i < slice.length; i++) {
+      const centered = slice[i] - mean;
+      sumSq += centered * centered;
+      const abs = Math.abs(centered);
+      if (abs > peak) peak = abs;
+    }
+    const rms = Math.sqrt(sumSq / Math.max(1, slice.length));
+
+    if (slice.length >= 3200 && rms >= 0.002) {
+      const gain = peak > 0.005 && peak < 0.7 ? Math.min(4.0, 0.7 / peak) : 1.0;
+      const pad = 2400; // 150ms
+      const prepared = new Float32Array(slice.length + pad * 2);
+      for (let i = 0; i < slice.length; i++) {
+        prepared[pad + i] = Math.max(-1, Math.min(1, (slice[i] - mean) * gain));
+      }
+      segments.push({
+        samples: prepared,
+        startTimeMs: Math.round((offset / sr) * 1000),
+        endTimeMs: Math.round((end / sr) * 1000),
+      });
+    }
+
+    offset = end;
+  }
+
+  return segments;
 }
