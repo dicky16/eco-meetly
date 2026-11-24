@@ -1,6 +1,6 @@
 {
   "name": "eco-meetly",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Privacy-first offline AI meeting assistant powered by Electron, Node.js, and local AI models",
   "main": "dist-electron/main.js",
   "scripts": {
