@@ -48,6 +48,7 @@ describe('DatabaseService', () => {
       endTimeMs: 3000,
       text: 'Halo semuanya, let us start.',
       detectedLanguage: 'id',
+      speaker: 'Speaker 1',
       createdAt: now,
     });
 

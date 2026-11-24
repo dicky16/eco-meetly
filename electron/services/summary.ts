@@ -2,7 +2,7 @@ import { ChildProcess, fork } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { AppSettings, BuiltinLlmModelInfo, SummaryTemplate } from '../types';
+import { AppSettings, BuiltinLlmModelInfo, SummaryTemplate, TranscriptSegment } from '../types';
 import { getModelsBaseDir } from './settings';
 
 export const SUMMARY_TEMPLATES: SummaryTemplate[] = [
@@ -70,6 +70,42 @@ const SUMMARY_LANG_NAMES: Record<string, string> = {
   fr: 'French',
   de: 'German',
 };
+
+export function detectDominantLanguage(
+  segments: Pick<TranscriptSegment, 'text' | 'detectedLanguage'>[],
+  fallbackLanguage: string
+): string {
+  const scores = new Map<string, number>();
+
+  for (const seg of segments) {
+    const words = seg.text.trim().split(/\s+/).filter(Boolean).length;
+    if (words === 0) continue;
+
+    if (seg.detectedLanguage && seg.detectedLanguage !== 'auto') {
+      scores.set(seg.detectedLanguage, (scores.get(seg.detectedLanguage) ?? 0) + words);
+    }
+
+    const lower = seg.text.toLowerCase();
+    const idHits = (lower.match(/\b(yang|dan|di|ke|dari|untuk|ini|itu|dengan|tidak|ada|kita|kami|saya|sudah|bisa|akan|jadi|atau|karena|kalau|ya|oke|baik|juga|dalam|pada)\b/g) ?? []).length;
+    const enHits = (lower.match(/\b(the|and|is|are|to|of|in|for|that|this|with|we|you|have|will|can|not|but|on|at|from|they|it|let|our)\b/g) ?? []).length;
+
+    if (idHits > enHits) {
+      scores.set('id', (scores.get('id') ?? 0) + idHits * 2);
+    } else if (enHits > idHits) {
+      scores.set('en', (scores.get('en') ?? 0) + enHits * 2);
+    }
+  }
+
+  let bestLang = fallbackLanguage;
+  let bestScore = 0;
+  for (const [lang, score] of scores.entries()) {
+    if (score > bestScore) {
+      bestScore = score;
+      bestLang = lang;
+    }
+  }
+  return bestLang;
+}
 
 export class SummaryService {
   private activeChild: ChildProcess | null = null;
@@ -167,12 +203,14 @@ export class SummaryService {
     transcriptText: string,
     settings: AppSettings,
     onToken: (chunk: string) => void,
-    customPrompt?: string
+    customPrompt?: string,
+    dominantLanguage?: string
   ): Promise<{ content: string; modelName: string }> {
     const template =
       SUMMARY_TEMPLATES.find((t) => t.id === settings.summaryTemplateId) ?? SUMMARY_TEMPLATES[0];
 
-    const langName = SUMMARY_LANG_NAMES[settings.primaryLanguage] ?? settings.primaryLanguage;
+    const targetLang = dominantLanguage || settings.primaryLanguage;
+    const langName = SUMMARY_LANG_NAMES[targetLang] ?? targetLang;
     const extraInstruction = customPrompt?.trim()
       ? `\n\nAdditional user instructions:\n${customPrompt.trim()}`
       : '';

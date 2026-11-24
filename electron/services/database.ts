@@ -55,6 +55,7 @@ export class DatabaseService {
         end_time_ms INTEGER NOT NULL,
         text TEXT NOT NULL,
         detected_language TEXT,
+        speaker TEXT,
         created_at TEXT NOT NULL,
         FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
       );
@@ -70,6 +71,12 @@ export class DatabaseService {
         FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
       );
     `);
+
+    // Safe schema migration for existing databases
+    const cols = db.exec(`PRAGMA table_info(transcript_segments)`)[0]?.values.map((r) => String(r[1])) ?? [];
+    if (!cols.includes('speaker')) {
+      db.run(`ALTER TABLE transcript_segments ADD COLUMN speaker TEXT`);
+    }
   }
 
   private persist(): void {
@@ -183,8 +190,8 @@ export class DatabaseService {
     const db = this.ensureDb();
     db.run(
       `INSERT INTO transcript_segments (
-        id, meeting_id, start_time_ms, end_time_ms, text, detected_language, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        id, meeting_id, start_time_ms, end_time_ms, text, detected_language, speaker, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         segment.id,
         segment.meetingId,
@@ -192,11 +199,22 @@ export class DatabaseService {
         segment.endTimeMs,
         segment.text,
         segment.detectedLanguage,
+        segment.speaker ?? null,
         segment.createdAt,
       ]
     );
     this.persist();
     return segment;
+  }
+
+  renameSpeaker(meetingId: string, oldSpeaker: string, newSpeaker: string): void {
+    const db = this.ensureDb();
+    db.run(`UPDATE transcript_segments SET speaker = ? WHERE meeting_id = ? AND speaker = ?`, [
+      newSpeaker,
+      meetingId,
+      oldSpeaker,
+    ]);
+    this.persist();
   }
 
   clearSegments(meetingId: string): void {
@@ -219,6 +237,7 @@ export class DatabaseService {
         endTimeMs: Number(obj.end_time_ms),
         text: String(obj.text),
         detectedLanguage: obj.detected_language ? String(obj.detected_language) : null,
+        speaker: obj.speaker ? String(obj.speaker) : null,
         createdAt: String(obj.created_at),
       });
     }

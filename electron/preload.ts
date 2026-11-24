@@ -27,6 +27,7 @@ export interface EcoMeetlyAPI {
   } | null>;
   updateMeetingTitle: (meetingId: string, title: string) => Promise<void>;
   deleteMeeting: (meetingId: string) => Promise<void>;
+  renameSpeaker: (meetingId: string, oldSpeaker: string, newSpeaker: string) => Promise<TranscriptSegment[]>;
 
   // Recording Lifecycle
   startRecording: (title?: string) => Promise<Meeting>;
@@ -36,7 +37,7 @@ export interface EcoMeetlyAPI {
     samples: Float32Array;
     startTimeMs: number;
     endTimeMs: number;
-  }) => Promise<TranscriptSegment | null>;
+  }) => Promise<TranscriptSegment[]>;
   stopRecording: (meetingId: string, durationSeconds: number) => Promise<Meeting | null>;
 
   // Import & Re-transcribe
@@ -71,6 +72,8 @@ const api: EcoMeetlyAPI = {
   getMeetingDetails: (meetingId) => ipcRenderer.invoke('meetings:details', meetingId),
   updateMeetingTitle: (meetingId, title) => ipcRenderer.invoke('meetings:update-title', meetingId, title),
   deleteMeeting: (meetingId) => ipcRenderer.invoke('meetings:delete', meetingId),
+  renameSpeaker: (meetingId, oldSpeaker, newSpeaker) =>
+    ipcRenderer.invoke('meetings:rename-speaker', meetingId, oldSpeaker, newSpeaker),
 
   startRecording: (title) => ipcRenderer.invoke('recording:start', title),
   sendAudioChunk48k: (samples) => ipcRenderer.send('recording:audio-48k', samples),

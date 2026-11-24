@@ -16,16 +16,19 @@ export class AudioCapturePipeline {
   private isSpeaking = false;
   private isPaused = false;
   private silenceFrames = 0;
+  private consecutiveVoiceFrames = 0;
+  private pendingOnsetFrames: Float32Array[] = [];
+  private noiseFloor = 0.003;
   private segmentStartMs = 0;
   private recordingStartTime = 0;
   private actualSampleRate = 48000;
 
   private readonly targetCaptureRate = 48000;
   private readonly preRollFrames = 4; // ~340 ms at 4096 samples / 48 kHz
-  private readonly vadThreshold = 0.007;
-  private readonly maxSilenceFrames = 12; // ~1.0 s pause before flushing
-  private readonly softSegmentSeconds = 12;
-  private readonly hardSegmentSeconds = 20;
+  private readonly minVadThreshold = 0.006;
+  private readonly maxSilenceFrames = 7; // ~0.6 s pause for responsive speaker turn-taking
+  private readonly softSegmentSeconds = 8;
+  private readonly hardSegmentSeconds = 16;
 
   async start(options: {
     includeSystemAudio: boolean;
@@ -42,6 +45,13 @@ export class AudioCapturePipeline {
 
     const mixer = this.audioCtx.createGain();
     mixer.gain.value = 1.0;
+
+    // 85 Hz high-pass filter removes AC hum, desk rumble, and mic pops without affecting speech
+    const highpass = this.audioCtx.createBiquadFilter();
+    highpass.type = 'highpass';
+    highpass.frequency.value = 85;
+    highpass.Q.value = 0.707;
+    mixer.connect(highpass);
 
     this.micStream = await navigator.mediaDevices.getUserMedia({
       audio: {
@@ -85,9 +95,12 @@ export class AudioCapturePipeline {
     this.recordingStartTime = Date.now();
     this.preRollBuffer = [];
     this.speechBuffer = [];
+    this.pendingOnsetFrames = [];
     this.speechSamples = 0;
     this.isSpeaking = false;
     this.silenceFrames = 0;
+    this.consecutiveVoiceFrames = 0;
+    this.noiseFloor = 0.003;
 
     const softLimitSamples = this.actualSampleRate * this.softSegmentSeconds;
     const hardLimitSamples = this.actualSampleRate * this.hardSegmentSeconds;
@@ -104,7 +117,7 @@ export class AudioCapturePipeline {
       // Path A: full mixed audio to RecordingSaver
       options.onChunk48k(copy);
 
-      // Compute RMS for UI meter & VAD
+      // Compute RMS for UI meter & adaptive VAD
       let sumSq = 0;
       for (let i = 0; i < copy.length; i++) {
         sumSq += copy[i] * copy[i];
@@ -113,26 +126,39 @@ export class AudioCapturePipeline {
       options.onLevel(Math.min(1, rms * 9));
 
       const nowMs = Date.now() - this.recordingStartTime;
-      const isVoice = rms >= this.vadThreshold;
+      const adaptiveThreshold = Math.max(this.minVadThreshold, Math.min(0.03, this.noiseFloor * 2.4));
+      const isVoice = rms >= adaptiveThreshold;
 
       if (isVoice) {
         if (!this.isSpeaking) {
-          this.isSpeaking = true;
-          const preRollMs = Math.round((this.preRollBuffer.length * copy.length * 1000) / this.actualSampleRate);
-          this.segmentStartMs = Math.max(0, nowMs - preRollMs);
-          // Prepend pre-roll frames so initial consonants/syllables are never clipped
-          for (const frame of this.preRollBuffer) {
-            this.speechBuffer.push(frame);
-            this.speechSamples += frame.length;
-          }
-          this.preRollBuffer = [];
-        }
-        this.silenceFrames = 0;
-        this.speechBuffer.push(copy);
-        this.speechSamples += copy.length;
+          this.consecutiveVoiceFrames++;
+          this.pendingOnsetFrames.push(copy);
 
-        if (this.speechSamples >= hardLimitSamples) {
-          this.flushSpeech(nowMs, options.onSpeechSegment16k);
+          // Require 2 consecutive active frames (~170ms) to filter transient keyboard/mic clicks
+          if (this.consecutiveVoiceFrames >= 2) {
+            this.isSpeaking = true;
+            const totalPreFrames = this.preRollBuffer.length + this.pendingOnsetFrames.length;
+            const preRollMs = Math.round((totalPreFrames * copy.length * 1000) / this.actualSampleRate);
+            this.segmentStartMs = Math.max(0, nowMs - preRollMs);
+            for (const frame of this.preRollBuffer) {
+              this.speechBuffer.push(frame);
+              this.speechSamples += frame.length;
+            }
+            for (const frame of this.pendingOnsetFrames) {
+              this.speechBuffer.push(frame);
+              this.speechSamples += frame.length;
+            }
+            this.preRollBuffer = [];
+            this.pendingOnsetFrames = [];
+          }
+        } else {
+          this.silenceFrames = 0;
+          this.speechBuffer.push(copy);
+          this.speechSamples += copy.length;
+
+          if (this.speechSamples >= hardLimitSamples) {
+            this.flushSpeech(nowMs, options.onSpeechSegment16k);
+          }
         }
       } else if (this.isSpeaking) {
         this.silenceFrames++;
@@ -147,15 +173,24 @@ export class AudioCapturePipeline {
           this.flushSpeech(nowMs, options.onSpeechSegment16k);
         }
       } else {
-        // Maintain rolling pre-roll buffer while idle
+        // Reset transient click state and adapt noise floor on quiet frames
+        if (this.pendingOnsetFrames.length > 0) {
+          for (const frame of this.pendingOnsetFrames) {
+            this.preRollBuffer.push(frame);
+          }
+          this.pendingOnsetFrames = [];
+        }
+        this.consecutiveVoiceFrames = 0;
+        this.noiseFloor = Math.max(0.002, Math.min(0.02, this.noiseFloor * 0.92 + rms * 0.08));
+
         this.preRollBuffer.push(copy);
-        if (this.preRollBuffer.length > this.preRollFrames) {
+        while (this.preRollBuffer.length > this.preRollFrames) {
           this.preRollBuffer.shift();
         }
       }
     };
 
-    mixer.connect(this.processor);
+    highpass.connect(this.processor);
     this.processor.connect(muteOut);
     muteOut.connect(this.audioCtx.destination);
   }

@@ -39,59 +39,83 @@ async function ensureLoaded(modelId: string, cacheDir: string, reqId: string): P
     env.cacheDir = cacheDir;
     env.allowLocalModels = true;
 
-    const fileProgress = new Map<string, { loaded: number; total: number }>();
-    let lastEmitAt = 0;
-    let lastPct = -1;
+    const loadPipeline = async () => {
+      const fileProgress = new Map<string, { loaded: number; total: number }>();
+      let lastEmitAt = 0;
+      let lastPct = -1;
 
-    transcriber = await pipeline('automatic-speech-recognition', modelId, {
-      dtype: 'q8',
-      progress_callback: (data: {
-        status?: string;
-        progress?: number;
-        file?: string;
-        loaded?: number;
-        total?: number;
-      }) => {
-        const fileName = data.file ? path.basename(data.file) : 'model';
-        if (data.status === 'progress' && typeof data.loaded === 'number' && typeof data.total === 'number' && data.total > 0) {
-          fileProgress.set(fileName, { loaded: data.loaded, total: data.total });
-        } else if (data.status === 'done' && fileProgress.has(fileName)) {
-          const entry = fileProgress.get(fileName)!;
-          fileProgress.set(fileName, { loaded: entry.total, total: entry.total });
-        }
+      return pipeline('automatic-speech-recognition', modelId, {
+        dtype: 'q8',
+        progress_callback: (data: {
+          status?: string;
+          progress?: number;
+          file?: string;
+          loaded?: number;
+          total?: number;
+        }) => {
+          const fileName = data.file ? path.basename(data.file) : 'model';
+          if (data.status === 'progress' && typeof data.loaded === 'number' && typeof data.total === 'number' && data.total > 0) {
+            fileProgress.set(fileName, { loaded: data.loaded, total: data.total });
+          } else if (data.status === 'done' && fileProgress.has(fileName)) {
+            const entry = fileProgress.get(fileName)!;
+            fileProgress.set(fileName, { loaded: entry.total, total: entry.total });
+          }
 
-        let sumLoaded = 0;
-        let sumTotal = 0;
-        for (const entry of fileProgress.values()) {
-          sumLoaded += entry.loaded;
-          sumTotal += entry.total;
-        }
+          let sumLoaded = 0;
+          let sumTotal = 0;
+          for (const entry of fileProgress.values()) {
+            sumLoaded += entry.loaded;
+            sumTotal += entry.total;
+          }
 
-        const computedPct =
-          sumTotal > 1_000_000
-            ? Math.min(99, Math.round((sumLoaded / sumTotal) * 100))
-            : undefined;
+          const computedPct =
+            sumTotal > 1_000_000
+              ? Math.min(99, Math.round((sumLoaded / sumTotal) * 100))
+              : undefined;
 
-        const now = Date.now();
-        if (now - lastEmitAt < 180 && computedPct === lastPct) return;
-        if (now - lastEmitAt < 120 && data.status === 'progress') return;
+          const now = Date.now();
+          if (now - lastEmitAt < 180 && computedPct === lastPct) return;
+          if (now - lastEmitAt < 120 && data.status === 'progress') return;
 
-        lastEmitAt = now;
-        if (typeof computedPct === 'number') lastPct = computedPct;
+          lastEmitAt = now;
+          if (typeof computedPct === 'number') lastPct = computedPct;
 
-        const mbLoaded = (sumLoaded / (1024 * 1024)).toFixed(1);
-        const mbTotal = (sumTotal / (1024 * 1024)).toFixed(1);
-        const detail = sumTotal > 0 ? ` (${mbLoaded} / ${mbTotal} MB)` : '';
+          const mbLoaded = (sumLoaded / (1024 * 1024)).toFixed(1);
+          const mbTotal = (sumTotal / (1024 * 1024)).toFixed(1);
+          const detail = sumTotal > 0 ? ` (${mbLoaded} / ${mbTotal} MB)` : '';
 
+          send({
+            type: 'progress',
+            reqId,
+            status: `Downloading ${path.basename(modelId)} — ${fileName}${detail}`,
+            progress: computedPct,
+            file: data.file,
+          });
+        },
+      });
+    };
+
+    try {
+      transcriber = await loadPipeline();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/protobuf parsing failed|onnx/i.test(msg)) {
+        // Auto-recover from partially downloaded/corrupt ONNX cache
+        const modelCacheA = path.join(cacheDir, ...modelId.split('/'));
+        const modelCacheB = path.join(cacheDir, modelId.replace('/', '--'));
+        fs.rmSync(modelCacheA, { recursive: true, force: true });
+        fs.rmSync(modelCacheB, { recursive: true, force: true });
         send({
           type: 'progress',
           reqId,
-          status: `Downloading ${path.basename(modelId)} — ${fileName}${detail}`,
-          progress: computedPct,
-          file: data.file,
+          status: `Repairing corrupt cache for ${path.basename(modelId)}...`,
+          progress: 0,
         });
-      },
-    });
+        transcriber = await loadPipeline();
+      } else {
+        throw err;
+      }
+    }
 
     loadedModelId = modelId;
     loadedCacheDir = cacheDir;
@@ -107,12 +131,17 @@ async function ensureLoaded(modelId: string, cacheDir: string, reqId: string): P
 function cleanWhisperOutput(raw: string): string {
   const trimmed = raw.trim();
   if (!trimmed) return '';
-  // Drop common Whisper silence hallucinations
+  // Drop common Whisper silence & YouTube-outro hallucinations
   const hallucinations = [
-    /^(\[blank_audio\]|\(musik\)|\(music\)|\[music\]|\.+)$/i,
-    /^(terima kasih\.?|thank you\.?|thanks for watching\.?|subtitles by.*)$/i,
+    /^(\[blank_audio\]|\(musik\)|\(music\)|\[music\]|\.+|[^\p{L}\p{N}]+)$/iu,
+    /^(terima kasih(\s+telah\s+menonton|\s+banyak)?\.?|sampai\s+jumpa\.?|jangan\s+lupa\s+(like|subscribe).*|thank you(\s+for\s+watching)?\.?|thanks\s+for\s+watching\.?|subtitles?\s+by.*)$/i,
   ];
   if (hallucinations.some((re) => re.test(trimmed))) {
+    return '';
+  }
+  // Reject pathological single-word repetition loops (e.g. "ya ya ya ya ya")
+  const words = trimmed.toLowerCase().split(/\s+/);
+  if (words.length >= 5 && new Set(words).size === 1) {
     return '';
   }
   return trimmed;
@@ -130,9 +159,21 @@ process.on('message', async (msg: WorkerRequest) => {
 
     if (msg.type === 'transcribe') {
       const task = inferQueue.then(async () => {
-        await ensureLoaded(msg.modelId, msg.cacheDir, msg.id);
         const buf = Buffer.from(msg.audioBase64, 'base64');
         const floatArray = new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4);
+
+        // Skip pure silence segments to save CPU and avoid hallucinations
+        let sumSq = 0;
+        for (let i = 0; i < floatArray.length; i++) {
+          sumSq += floatArray[i] * floatArray[i];
+        }
+        const rms = Math.sqrt(sumSq / Math.max(1, floatArray.length));
+        if (floatArray.length < 1600 || rms < 0.0015) {
+          send({ type: 'result', reqId: msg.id, data: { text: '' } });
+          return;
+        }
+
+        await ensureLoaded(msg.modelId, msg.cacheDir, msg.id);
 
         const options: Record<string, unknown> = {
           task: msg.task,

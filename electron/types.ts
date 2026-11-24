@@ -47,6 +47,7 @@ export interface TranscriptSegment {
   endTimeMs: number;
   text: string;
   detectedLanguage: string | null;
+  speaker: string | null;
   createdAt: string;
 }
 

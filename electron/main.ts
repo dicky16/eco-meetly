@@ -4,11 +4,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { DatabaseService } from './services/database';
+import { SpeakerTracker, splitIntoSentences } from './services/diarization';
 import { exportMeetingArtifacts } from './services/meetingExporter';
 import { RecordingSaver } from './services/recordingSaver';
 import { SettingsService } from './services/settings';
-import { SUMMARY_TEMPLATES, SummaryService } from './services/summary';
-import { TranscriptionService } from './services/transcription';
+import { detectDominantLanguage, SUMMARY_TEMPLATES, SummaryService } from './services/summary';
+import { segmentPcm16kSmart, TranscriptionService } from './services/transcription';
 import { AppSettings, Meeting, TranscriptSegment } from './types';
 
 let mainWindow: BrowserWindow | null = null;
@@ -20,6 +21,16 @@ const summaryService = new SummaryService();
 
 let activeMeetingId: string | null = null;
 let activeAudioPath: string | null = null;
+const speakerTrackers = new Map<string, SpeakerTracker>();
+
+function getSpeakerTracker(meetingId: string): SpeakerTracker {
+  let tracker = speakerTrackers.get(meetingId);
+  if (!tracker) {
+    tracker = new SpeakerTracker();
+    speakerTrackers.set(meetingId, tracker);
+  }
+  return tracker;
+}
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
@@ -52,6 +63,43 @@ function createWindow(): void {
 
 function sanitizeFolderName(name: string): string {
   return name.replace(/[^a-zA-Z0-9-_ ]/g, '').trim().replace(/\s+/g, '-') || 'meeting';
+}
+
+async function transcribePcm16kSegments(
+  meetingId: string,
+  pcm16k: Float32Array,
+  settings: AppSettings
+): Promise<TranscriptSegment[]> {
+  speakerTrackers.set(meetingId, new SpeakerTracker());
+  const tracker = getSpeakerTracker(meetingId);
+  const smartSegments = segmentPcm16kSmart(pcm16k);
+  const created: TranscriptSegment[] = [];
+  for (const segInfo of smartSegments) {
+    const speaker = tracker.identifySpeaker(segInfo.samples);
+    const res = await transcriptionService.transcribeFloat32(segInfo.samples, settings, (info) => {
+      mainWindow?.webContents.send('model:progress', { kind: 'whisper', ...info });
+    });
+    if (res.text) {
+      const sentences = splitIntoSentences(res.text);
+      const totalMs = Math.max(1, segInfo.endTimeMs - segInfo.startTimeMs);
+      const stepMs = Math.floor(totalMs / sentences.length);
+      sentences.forEach((sentence, idx) => {
+        const seg = dbService.addSegment({
+          id: crypto.randomUUID(),
+          meetingId,
+          startTimeMs: segInfo.startTimeMs + idx * stepMs,
+          endTimeMs: idx === sentences.length - 1 ? segInfo.endTimeMs : segInfo.startTimeMs + (idx + 1) * stepMs,
+          text: sentence,
+          detectedLanguage: res.detectedLanguage,
+          speaker,
+          createdAt: new Date().toISOString(),
+        });
+        created.push(seg);
+      });
+    }
+  }
+  speakerTrackers.delete(meetingId);
+  return created;
 }
 
 function registerIpcHandlers(): void {
@@ -112,6 +160,16 @@ function registerIpcHandlers(): void {
     dbService.deleteMeeting(meetingId);
   });
 
+  ipcMain.handle('meetings:rename-speaker', (_e, meetingId: string, oldSpeaker: string, newSpeaker: string) => {
+    dbService.renameSpeaker(meetingId, oldSpeaker, newSpeaker);
+    const meeting = dbService.getMeeting(meetingId);
+    const updatedSegments = dbService.getSegments(meetingId);
+    if (meeting) {
+      exportMeetingArtifacts(meeting, updatedSegments, dbService.getLatestSummary(meetingId));
+    }
+    return updatedSegments;
+  });
+
   // Recording Lifecycle
   ipcMain.handle('recording:start', async (_e, customTitle?: string) => {
     if (process.platform === 'darwin') {
@@ -166,24 +224,30 @@ function registerIpcHandlers(): void {
     async (
       _e,
       payload: { meetingId: string; samples: Float32Array; startTimeMs: number; endTimeMs: number }
-    ): Promise<TranscriptSegment | null> => {
+    ): Promise<TranscriptSegment[]> => {
       const settings = settingsService.getSettings();
+      const speaker = getSpeakerTracker(payload.meetingId).identifySpeaker(payload.samples);
       const result = await transcriptionService.transcribeFloat32(payload.samples, settings, (info) => {
         mainWindow?.webContents.send('model:progress', { kind: 'whisper', ...info });
       });
 
-      if (!result.text) return null;
+      if (!result.text) return [];
 
-      const segment: TranscriptSegment = {
-        id: crypto.randomUUID(),
-        meetingId: payload.meetingId,
-        startTimeMs: payload.startTimeMs,
-        endTimeMs: payload.endTimeMs,
-        text: result.text,
-        detectedLanguage: result.detectedLanguage,
-        createdAt: new Date().toISOString(),
-      };
-      return dbService.addSegment(segment);
+      const sentences = splitIntoSentences(result.text);
+      const totalMs = Math.max(1, payload.endTimeMs - payload.startTimeMs);
+      const stepMs = Math.floor(totalMs / sentences.length);
+      return sentences.map((sentence, idx) =>
+        dbService.addSegment({
+          id: crypto.randomUUID(),
+          meetingId: payload.meetingId,
+          startTimeMs: payload.startTimeMs + idx * stepMs,
+          endTimeMs: idx === sentences.length - 1 ? payload.endTimeMs : payload.startTimeMs + (idx + 1) * stepMs,
+          text: sentence,
+          detectedLanguage: result.detectedLanguage,
+          speaker,
+          createdAt: new Date().toISOString(),
+        })
+      );
     }
   );
 
@@ -191,6 +255,7 @@ function registerIpcHandlers(): void {
     const savedPath = recordingSaver.stop();
     activeMeetingId = null;
     activeAudioPath = null;
+    speakerTrackers.delete(meetingId);
 
     dbService.updateMeeting(meetingId, {
       status: 'completed',
@@ -245,25 +310,7 @@ function registerIpcHandlers(): void {
       status: 'completed',
     });
 
-    // Transcribe in 25s chunks
-    const chunkLen = 16000 * 25;
-    for (let offset = 0; offset < pcm16k.length; offset += chunkLen) {
-      const slice = pcm16k.subarray(offset, Math.min(offset + chunkLen, pcm16k.length));
-      const res = await transcriptionService.transcribeFloat32(slice, settings, (info) => {
-        mainWindow?.webContents.send('model:progress', { kind: 'whisper', ...info });
-      });
-      if (res.text) {
-        dbService.addSegment({
-          id: crypto.randomUUID(),
-          meetingId: meeting.id,
-          startTimeMs: Math.round((offset / 16000) * 1000),
-          endTimeMs: Math.round((Math.min(offset + chunkLen, pcm16k.length) / 16000) * 1000),
-          text: res.text,
-          detectedLanguage: res.detectedLanguage,
-          createdAt: new Date().toISOString(),
-        });
-      }
-    }
+    await transcribePcm16kSegments(meeting.id, pcm16k, settings);
 
     exportMeetingArtifacts(meeting, dbService.getSegments(meeting.id), null);
     return meeting;
@@ -278,26 +325,7 @@ function registerIpcHandlers(): void {
     const pcm16k = await transcriptionService.decodeAudioFileTo16k(meeting.audioPath);
     dbService.clearSegments(meetingId);
 
-    const chunkLen = 16000 * 25;
-    const newSegments: TranscriptSegment[] = [];
-    for (let offset = 0; offset < pcm16k.length; offset += chunkLen) {
-      const slice = pcm16k.subarray(offset, Math.min(offset + chunkLen, pcm16k.length));
-      const res = await transcriptionService.transcribeFloat32(slice, settings, (info) => {
-        mainWindow?.webContents.send('model:progress', { kind: 'whisper', ...info });
-      });
-      if (res.text) {
-        const seg = dbService.addSegment({
-          id: crypto.randomUUID(),
-          meetingId,
-          startTimeMs: Math.round((offset / 16000) * 1000),
-          endTimeMs: Math.round((Math.min(offset + chunkLen, pcm16k.length) / 16000) * 1000),
-          text: res.text,
-          detectedLanguage: res.detectedLanguage,
-          createdAt: new Date().toISOString(),
-        });
-        newSegments.push(seg);
-      }
-    }
+    const newSegments = await transcribePcm16kSegments(meetingId, pcm16k, settings);
     exportMeetingArtifacts(meeting, newSegments, dbService.getLatestSummary(meetingId));
     return newSegments;
   });
@@ -326,8 +354,9 @@ function registerIpcHandlers(): void {
       throw new Error('No transcript segments available to summarize.');
     }
 
-    const transcriptText = segments.map((s) => s.text).join('\n');
+    const transcriptText = segments.map((s) => `${s.speaker ? `[${s.speaker}]: ` : ''}${s.text}`).join('\n');
     const settings = settingsService.getSettings();
+    const dominantLanguage = detectDominantLanguage(segments, settings.primaryLanguage);
 
     const { content, modelName } = await summaryService.generateSummary(
       transcriptText,
@@ -335,7 +364,8 @@ function registerIpcHandlers(): void {
       (token) => {
         mainWindow?.webContents.send('summary:token', { meetingId, token });
       },
-      customPrompt
+      customPrompt,
+      dominantLanguage
     );
 
     const saved = dbService.saveSummary({

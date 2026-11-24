@@ -39,6 +39,7 @@ describe('exportMeetingArtifacts', () => {
         endTimeMs: 5000,
         text: 'Kita bahas roadmap minggu ini.',
         detectedLanguage: 'id',
+        speaker: 'Speaker 1',
         createdAt: '2026-11-23T10:00:05.000Z',
       },
     ];
@@ -60,7 +61,7 @@ describe('exportMeetingArtifacts', () => {
     const notesMd = fs.readFileSync(path.join(meeting.folderPath, 'meeting-notes.md'), 'utf-8');
     const timestampedFiles = fs.readdirSync(meeting.folderPath).filter((f) => /^summary_\d{8}-\d{6}\.md$/.test(f));
 
-    expect(transcript).toContain('[00:00 - 00:05] [ID] Kita bahas roadmap minggu ini.');
+    expect(transcript).toContain('[00:00 - 00:05] [Speaker 1] [ID] Kita bahas roadmap minggu ini.');
     expect(summaryMd).toContain('Roadmap finalized.');
     expect(timestampedFiles).toHaveLength(1);
     expect(notesMd).toContain('# Product Sync');

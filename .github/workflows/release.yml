@@ -1,0 +1,184 @@
+name: Auto Release (SemVer)
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  version-and-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.semver.outputs.should_release }}
+      new_tag: ${{ steps.semver.outputs.new_tag }}
+      new_version: ${{ steps.semver.outputs.new_version }}
+      release_notes: ${{ steps.semver.outputs.release_notes }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute SemVer bump and commit history
+        id: semver
+        env:
+          GH_REPO: ${{ github.repository }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          if [ -z "$LAST_TAG" ]; then
+            RANGE="HEAD"
+            BASE_VERSION="0.0.0"
+          else
+            RANGE="${LAST_TAG}..HEAD"
+            BASE_VERSION="${LAST_TAG#v}"
+          fi
+
+          COMMITS=$(git log "$RANGE" --pretty=format:"%H|%s" --no-merges)
+          if [ -z "$COMMITS" ]; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          BUMP="none"
+          NOTES_FILE=$(mktemp)
+          echo "## What's Changed" >> "$NOTES_FILE"
+          echo "" >> "$NOTES_FILE"
+
+          while IFS='|' read -r SHA SUBJECT; do
+            [ -z "$SHA" ] && continue
+            # Skip automated release bump commits
+            if [[ "$SUBJECT" == chore\(release\):* ]]; then
+              continue
+            fi
+
+            SHORT_SHA="${SHA:0:7}"
+            echo "- ${SUBJECT} ([\`${SHORT_SHA}\`](https://github.com/${GH_REPO}/commit/${SHA}))" >> "$NOTES_FILE"
+
+            BODY=$(git log -1 --format="%b" "$SHA")
+            if [[ "$SUBJECT" =~ ^[a-z]+(\([^)]+\))?!: ]] || [[ "$BODY" == *"BREAKING CHANGE:"* ]]; then
+              BUMP="major"
+            elif [[ "$SUBJECT" =~ ^feat(\([^)]+\))?: ]] && [ "$BUMP" != "major" ]; then
+              BUMP="minor"
+            elif [[ "$SUBJECT" =~ ^(fix|perf|refactor)(\([^)]+\))?: ]] && [ "$BUMP" == "none" ]; then
+              BUMP="patch"
+            fi
+          done <<< "$COMMITS"
+
+          if [ "$BUMP" == "none" ]; then
+            echo "No releasable commits found."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$BASE_VERSION"
+          MAJOR=${MAJOR:-0}; MINOR=${MINOR:-0}; PATCH=${PATCH:-0}
+          case "$BUMP" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+          esac
+
+          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          NEW_TAG="v${NEW_VERSION}"
+
+          if [ -n "$LAST_TAG" ]; then
+            echo "" >> "$NOTES_FILE"
+            echo "**Full Changelog:** https://github.com/${GH_REPO}/compare/${LAST_TAG}...${NEW_TAG}" >> "$NOTES_FILE"
+          fi
+
+          npm version "$NEW_VERSION" --no-git-tag-version
+          git add package.json package-lock.json 2>/dev/null || git add package.json
+          git commit -m "chore(release): ${NEW_TAG}"
+          git tag -a "$NEW_TAG" -m "Release ${NEW_TAG}"
+          git push origin master --follow-tags
+
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+          echo "new_tag=${NEW_TAG}" >> "$GITHUB_OUTPUT"
+          echo "new_version=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
+          {
+            echo "release_notes<<EOF"
+            cat "$NOTES_FILE"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  build-and-publish:
+    needs: version-and-tag
+    if: needs.version-and-tag.outputs.should_release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            platform: mac
+          - os: windows-latest
+            platform: win
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version-and-tag.outputs.new_tag }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+      - run: npm test
+      - run: npm run typecheck
+      - run: npm run build
+      - name: Package installer (${{ matrix.platform }})
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+        run: npx electron-builder --${{ matrix.platform }} --publish never
+
+      - name: Upload installer artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: installers-${{ matrix.platform }}
+          path: |
+            release/*.dmg
+            release/*.zip
+            release/*.exe
+          if-no-files-found: error
+
+  create-release-and-prune:
+    needs: [version-and-tag, build-and-publish]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release with macOS & Windows installers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version-and-tag.outputs.new_tag }}
+          NOTES: ${{ needs.version-and-tag.outputs.release_notes }}
+        run: |
+          FILES=$(find artifacts -type f \( -name "*.dmg" -o -name "*.zip" -o -name "*.exe" \))
+          gh release create "$TAG" $FILES --title "Eco Meetly ${TAG}" --notes "$NOTES"
+
+      - name: Keep at most 10 release tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # List tags sorted newest first and prune anything beyond the top 10
+          TAGS=$(git tag --sort=-v:refname)
+          COUNT=0
+          for T in $TAGS; do
+            COUNT=$((COUNT + 1))
+            if [ "$COUNT" -gt 10 ]; then
+              echo "Pruning old release/tag: $T"
+              gh release delete "$T" --yes --cleanup-tag || git push origin --delete "$T" || true
+            fi
+          done

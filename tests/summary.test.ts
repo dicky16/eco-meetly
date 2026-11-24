@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getDefaultSettings } from '../electron/services/settings';
-import { BUILTIN_LLM_MODELS, SUMMARY_TEMPLATES, SummaryService } from '../electron/services/summary';
+import { BUILTIN_LLM_MODELS, detectDominantLanguage, SUMMARY_TEMPLATES, SummaryService } from '../electron/services/summary';
 
 vi.mock('electron', () => ({
   app: {
@@ -79,5 +79,20 @@ describe('SummaryService', () => {
     expect(tokens.join('')).toBe('## Summary\nAll tasks assigned.');
     expect(res.content).toBe('## Summary\nAll tasks assigned.');
     expect(res.modelName).toBe('qwen2.5:3b');
+  });
+
+  it('detects dominant meeting language for summary output (English vs Indonesian)', () => {
+    const enSegments = [
+      { text: 'We need to finalize the release timeline for next week.', detectedLanguage: 'en' },
+      { text: 'Let us review the action items and assign owners.', detectedLanguage: 'en' },
+      { text: 'Oke siap.', detectedLanguage: 'id' },
+    ];
+    expect(detectDominantLanguage(enSegments, 'id')).toBe('en');
+
+    const idSegments = [
+      { text: 'Kita harus selesaikan rilis aplikasi minggu ini.', detectedLanguage: 'auto' },
+      { text: 'Untuk bagian backend dan database sudah aman.', detectedLanguage: 'auto' },
+    ];
+    expect(detectDominantLanguage(idSegments, 'en')).toBe('id');
   });
 });
