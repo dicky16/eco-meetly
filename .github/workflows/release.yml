@@ -45,15 +45,19 @@ jobs:
           fi
 
           BUMP="none"
+          FEAT_LIST=$(mktemp)
+          FIX_LIST=$(mktemp)
+          PERF_LIST=$(mktemp)
+          OTHER_LIST=$(mktemp)
           NOTES_FILE=$(mktemp)
-          echo "## What's Changed" >> "$NOTES_FILE"
-          echo "" >> "$NOTES_FILE"
 
           RE_BREAKING='^[a-z]+(\([^)]+\))?!:'
           RE_FEAT='^feat(\([^)]+\))?:'
+          RE_FIX='^fix(\([^)]+\))?:'
+          RE_PERF='^(perf|refactor)(\([^)]+\))?:'
           RE_PATCH='^(fix|perf|refactor)(\([^)]+\))?:'
 
-          while IFS='|' read -r SHA SUBJECT; do
+          while IFS='|' read -r SHA SUBJECT || [ -n "$SHA" ]; do
             [ -z "$SHA" ] && continue
             # Skip automated release bump commits
             if [[ "$SUBJECT" == chore\(release\):* ]]; then
@@ -61,7 +65,17 @@ jobs:
             fi
 
             SHORT_SHA="${SHA:0:7}"
-            echo "- ${SUBJECT} ([\`${SHORT_SHA}\`](https://github.com/${GH_REPO}/commit/${SHA}))" >> "$NOTES_FILE"
+            ENTRY="- ${SUBJECT} ([\`${SHORT_SHA}\`](https://github.com/${GH_REPO}/commit/${SHA}))"
+
+            if [[ "$SUBJECT" =~ $RE_FEAT ]]; then
+              echo "$ENTRY" >> "$FEAT_LIST"
+            elif [[ "$SUBJECT" =~ $RE_FIX ]]; then
+              echo "$ENTRY" >> "$FIX_LIST"
+            elif [[ "$SUBJECT" =~ $RE_PERF ]]; then
+              echo "$ENTRY" >> "$PERF_LIST"
+            else
+              echo "$ENTRY" >> "$OTHER_LIST"
+            fi
 
             BODY=$(git log -1 --format="%b" "$SHA")
             if [[ "$SUBJECT" =~ $RE_BREAKING ]] || [[ "$BODY" == *"BREAKING CHANGE:"* ]]; then
@@ -90,9 +104,33 @@ jobs:
           NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
           NEW_TAG="v${NEW_VERSION}"
 
-          if [ -n "$LAST_TAG" ]; then
+          echo "## Release ${NEW_TAG}" >> "$NOTES_FILE"
+          if [ -s "$FEAT_LIST" ]; then
             echo "" >> "$NOTES_FILE"
+            echo "### Features" >> "$NOTES_FILE"
+            cat "$FEAT_LIST" >> "$NOTES_FILE"
+          fi
+          if [ -s "$FIX_LIST" ]; then
+            echo "" >> "$NOTES_FILE"
+            echo "### Bug Fixes" >> "$NOTES_FILE"
+            cat "$FIX_LIST" >> "$NOTES_FILE"
+          fi
+          if [ -s "$PERF_LIST" ]; then
+            echo "" >> "$NOTES_FILE"
+            echo "### Improvements & Refactors" >> "$NOTES_FILE"
+            cat "$PERF_LIST" >> "$NOTES_FILE"
+          fi
+          if [ -s "$OTHER_LIST" ]; then
+            echo "" >> "$NOTES_FILE"
+            echo "### Other Changes" >> "$NOTES_FILE"
+            cat "$OTHER_LIST" >> "$NOTES_FILE"
+          fi
+
+          echo "" >> "$NOTES_FILE"
+          if [ -n "$LAST_TAG" ]; then
             echo "**Full Changelog:** https://github.com/${GH_REPO}/compare/${LAST_TAG}...${NEW_TAG}" >> "$NOTES_FILE"
+          else
+            echo "**Full Commit History:** https://github.com/${GH_REPO}/commits/${NEW_TAG}" >> "$NOTES_FILE"
           fi
 
           npm version "$NEW_VERSION" --no-git-tag-version --allow-same-version
