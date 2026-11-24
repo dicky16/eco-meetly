@@ -95,9 +95,11 @@ jobs:
             echo "**Full Changelog:** https://github.com/${GH_REPO}/compare/${LAST_TAG}...${NEW_TAG}" >> "$NOTES_FILE"
           fi
 
-          npm version "$NEW_VERSION" --no-git-tag-version
-          git add package.json package-lock.json 2>/dev/null || git add package.json
-          git commit -m "chore(release): ${NEW_TAG}"
+          npm version "$NEW_VERSION" --no-git-tag-version --allow-same-version
+          if ! git diff --quiet package.json; then
+            git add package.json package-lock.json 2>/dev/null || git add package.json
+            git commit -m "chore(release): ${NEW_TAG}"
+          fi
           git tag -a "$NEW_TAG" -m "Release ${NEW_TAG}"
           git push origin master --follow-tags
 
