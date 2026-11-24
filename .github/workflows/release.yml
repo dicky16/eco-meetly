@@ -49,6 +49,10 @@ jobs:
           echo "## What's Changed" >> "$NOTES_FILE"
           echo "" >> "$NOTES_FILE"
 
+          RE_BREAKING='^[a-z]+(\([^)]+\))?!:'
+          RE_FEAT='^feat(\([^)]+\))?:'
+          RE_PATCH='^(fix|perf|refactor)(\([^)]+\))?:'
+
           while IFS='|' read -r SHA SUBJECT; do
             [ -z "$SHA" ] && continue
             # Skip automated release bump commits
@@ -60,11 +64,11 @@ jobs:
             echo "- ${SUBJECT} ([\`${SHORT_SHA}\`](https://github.com/${GH_REPO}/commit/${SHA}))" >> "$NOTES_FILE"
 
             BODY=$(git log -1 --format="%b" "$SHA")
-            if [[ "$SUBJECT" =~ ^[a-z]+(\([^)]+\))?!: ]] || [[ "$BODY" == *"BREAKING CHANGE:"* ]]; then
+            if [[ "$SUBJECT" =~ $RE_BREAKING ]] || [[ "$BODY" == *"BREAKING CHANGE:"* ]]; then
               BUMP="major"
-            elif [[ "$SUBJECT" =~ ^feat(\([^)]+\))?: ]] && [ "$BUMP" != "major" ]; then
+            elif [[ "$SUBJECT" =~ $RE_FEAT ]] && [ "$BUMP" != "major" ]; then
               BUMP="minor"
-            elif [[ "$SUBJECT" =~ ^(fix|perf|refactor)(\([^)]+\))?: ]] && [ "$BUMP" == "none" ]; then
+            elif [[ "$SUBJECT" =~ $RE_PATCH ]] && [ "$BUMP" == "none" ]; then
               BUMP="patch"
             fi
           done <<< "$COMMITS"
